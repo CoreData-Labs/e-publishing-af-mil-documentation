@@ -25,8 +25,6 @@ import ( // start of the standard library import block
 type publicationCatalog struct { // holds the settings needed to query a single catalog
 	catalogName                    string // human readable label used in log messages
 	endpointUniformResourceLocator string // full API address that returns the catalog payload
-	tabIdentifier                  string // value sent in the TabId header for this catalog
-	moduleIdentifier               string // value sent in the ModuleId header for this catalog
 } // end of publicationCatalog type
 
 // publicationCatalogsInProcessingOrder lists every catalog; each one is fully downloaded before the next starts
@@ -34,20 +32,14 @@ var publicationCatalogsInProcessingOrder = []publicationCatalog{ // ordered slic
 	{ // first catalog entry
 		catalogName:                    "AirForceDepartmentalPublications",                                                                                 // label for the first API
 		endpointUniformResourceLocator: "https://www.e-publishing.af.mil/DesktopModules/MVC/EPUBS/EPUB/GetPubsBySeriesView/?orgID=10141&catID=1&series=-1", // first API address
-		tabIdentifier:                  "131",                                                                                                              // TabId header value for the first API
-		moduleIdentifier:               "449",                                                                                                              // ModuleId header value for the first API
 	}, // end of first catalog entry
 	{ // second catalog entry
 		catalogName:                    "AirNationalGuardAllPublications",                                                                                // label for the second API
 		endpointUniformResourceLocator: "https://www.e-publishing.af.mil/DesktopModules/MVC/EPUBS/EPUB/GetPubsBySeriesView/?orgID=44&catID=16&series=-1", // second API address
-		tabIdentifier:                  "131",                                                                                                            // TabId header value for the second API
-		moduleIdentifier:               "449",                                                                                                            // ModuleId header value for the second API
 	}, // end of second catalog entry
 	{ // third catalog entry
 		catalogName:                    "UnitedStatesSpaceForceCombatForcesCommandAllPublications",                                                       // label for the third API
 		endpointUniformResourceLocator: "https://www.e-publishing.af.mil/DesktopModules/MVC/EPUBS/EPUB/GetPubsBySeriesView/?orgID=47&catID=20&series=-1", // third API address
-		tabIdentifier:                  "131",                                                                                                            // TabId header value for the third API
-		moduleIdentifier:               "449",                                                                                                            // ModuleId header value for the third API
 	}, // end of third catalog entry
 } // end of the catalog list
 
@@ -101,9 +93,9 @@ func fetchPublicationCatalog(executionScopeContext context.Context, catalogToFet
 		return "", fmt.Errorf("failed to construct request for catalog %s: %w", catalogToFetch.catalogName, requestConstructionError) // return wrapped error description
 	} // end request check
 
-	applyBrowserRequestHeaders(hypertextTransferProtocolRequest)                             // attach browser headers to satisfy endpoint security
-	hypertextTransferProtocolRequest.Header.Set("TabId", catalogToFetch.tabIdentifier)       // configure portal tab identifier for this catalog
-	hypertextTransferProtocolRequest.Header.Set("ModuleId", catalogToFetch.moduleIdentifier) // configure target module identifier for this catalog
+	applyBrowserRequestHeaders(hypertextTransferProtocolRequest)   // attach browser headers to satisfy endpoint security
+	hypertextTransferProtocolRequest.Header.Set("TabId", "131")    // configure portal tab identifier
+	hypertextTransferProtocolRequest.Header.Set("ModuleId", "449") // configure target module identifier
 
 	slog.Info("Dispatching HTTP request to query the publication catalog", "catalog", catalogToFetch.catalogName, "endpoint", catalogToFetch.endpointUniformResourceLocator) // log catalog retrieval attempt
 
