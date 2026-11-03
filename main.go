@@ -7,7 +7,7 @@ import ( // start of the standard library import block
 	"errors"        // package for inspecting and comparing standard error values
 	"fmt"           // package for formatted input and output string operations
 	"io"            // package for foundational sequential data stream interactions
-	"log"           // package providing structured timestamped logging to standard output
+	"log"           // package providing timestamped logging to standard output
 	"log/slog"      // package providing structured key-value logging capabilities
 	"net/http"      // package providing comprehensive HTTP client and server features
 	"net/url"       // package for parsing, validating, and escaping web addresses
@@ -21,13 +21,58 @@ import ( // start of the standard library import block
 	"time"          // package providing utilities for durations, clocks, and timeouts
 ) // end of the standard library import block
 
+// publicationCatalog describes one catalog API that lists publications
+type publicationCatalog struct { // holds the settings needed to query a single catalog
+	catalogName                    string // human readable label used in log messages
+	endpointUniformResourceLocator string // full API address that returns the catalog payload
+} // end of publicationCatalog type
+
+// publicationCatalogsInProcessingOrder lists every catalog; each one is fully downloaded before the next starts
+var publicationCatalogsInProcessingOrder = []publicationCatalog{ // ordered slice so the first API always runs first
+	{ // first catalog entry
+		catalogName:                    "AirForceDepartmentalPublications",                                                                                 // label for the first API
+		endpointUniformResourceLocator: "https://www.e-publishing.af.mil/DesktopModules/MVC/EPUBS/EPUB/GetPubsBySeriesView/?orgID=10141&catID=1&series=-1", // first API address
+	}, // end of first catalog entry
+	{ // second catalog entry
+		catalogName:                    "AirNationalGuardAllPublications",                                                                                // label for the second API
+		endpointUniformResourceLocator: "https://www.e-publishing.af.mil/DesktopModules/MVC/EPUBS/EPUB/GetPubsBySeriesView/?orgID=44&catID=16&series=-1", // second API address
+	}, // end of second catalog entry
+	{ // third catalog entry
+		catalogName:                    "UnitedStatesSpaceForceCombatForcesCommandAllPublications",                                                       // label for the third API
+		endpointUniformResourceLocator: "https://www.e-publishing.af.mil/DesktopModules/MVC/EPUBS/EPUB/GetPubsBySeriesView/?orgID=47&catID=20&series=-1", // third API address
+	}, // end of third catalog entry
+} // end of the catalog list
+
 // portableDocumentFormatRegularExpression locates target PDF URLs inside raw catalog HTML
 var portableDocumentFormatRegularExpression = regexp.MustCompile(`(?i)https?://[^"'\s<>\\]+\.pdf`) // compiled once during application startup
 
-// sharedHypertextTransferProtocolClient provides pooled connections with an idle socket timeout
+// invalidFilenameCharacterRunRegularExpression matches any run of one or more characters that are not 0-9 or a-z
+var invalidFilenameCharacterRunRegularExpression = regexp.MustCompile(`[^a-z0-9]+`) // a whole run becomes one underscore, so "__" can never appear
+
+// fallbackFilenameBase is used when sanitizing leaves nothing behind (for example a name made only of symbols)
+const fallbackFilenameBase = "document" // safe default base name without extension
+
+// portableDocumentFormatExtension is the extension appended to every sanitized file name
+const portableDocumentFormatExtension = ".pdf" // lowercase extension, valid for every saved file
+
+// sharedHypertextTransferProtocolClient provides pooled connections with an overall request timeout
 var sharedHypertextTransferProtocolClient = &http.Client{ // configure globally accessible HTTP client
 	Timeout: 180 * time.Second, // establish client-side network timeout ceiling
 } // finish HTTP client configuration
+
+// buildSafePortableDocumentFormatFilename converts any raw name into a valid PDF file name.
+// Rules: only 0-9, a-z and _ are allowed, no leading or trailing _, and no repeated __.
+func buildSafePortableDocumentFormatFilename(rawFilename string) string { // accepts any raw name, returns a clean name with .pdf
+	filenameWithoutExtension := strings.TrimSuffix(rawFilename, portableDocumentFormatExtension)                 // drop a lowercase .pdf extension if present
+	filenameWithoutExtension = strings.TrimSuffix(filenameWithoutExtension, ".PDF")                              // drop an uppercase .PDF extension if present
+	lowercaseFilename := strings.ToLower(filenameWithoutExtension)                                               // lowercase everything because A-Z is not an allowed range
+	underscoredFilename := invalidFilenameCharacterRunRegularExpression.ReplaceAllString(lowercaseFilename, "_") // replace every run of invalid characters (including existing underscores) with one underscore
+	trimmedFilename := strings.Trim(underscoredFilename, "_")                                                    // remove any underscore at the start or the end
+	if trimmedFilename == "" {                                                                                   // check whether nothing valid was left
+		trimmedFilename = fallbackFilenameBase // use the fallback base name instead of an empty name
+	} // end empty-name check
+	return trimmedFilename + portableDocumentFormatExtension // attach the .pdf extension and return the final name
+} // end of buildSafePortableDocumentFormatFilename function
 
 // applyBrowserRequestHeaders applies all necessary headers to mimic an authorized desktop browser
 func applyBrowserRequestHeaders(hypertextTransferProtocolRequest *http.Request) { // accepts pointer to target request
@@ -41,51 +86,49 @@ func applyBrowserRequestHeaders(hypertextTransferProtocolRequest *http.Request) 
 	hypertextTransferProtocolRequest.Header.Set("DNT", "1")                                                                                                                     // signal request not to track browsing
 } // end of applyBrowserRequestHeaders function
 
-// fetchAirForceDepartmentalAllPublications queries the catalog endpoint and yields the response string
-func fetchAirForceDepartmentalAllPublications(executionScopeContext context.Context) (string, error) { // returns string body and error
-	endpointUniformResourceLocator := "https://www.e-publishing.af.mil/DesktopModules/MVC/EPUBS/EPUB/GetPubsBySeriesView/?orgID=10141&catID=1&series=-1" // define endpoint URL string
-
-	hypertextTransferProtocolRequest, requestConstructionError := http.NewRequestWithContext(executionScopeContext, http.MethodGet, endpointUniformResourceLocator, nil) // build request with context
-	if requestConstructionError != nil {                                                                                                                                 // check whether request assembly failed
-		return "", fmt.Errorf("failed to construct publication index request: %w", requestConstructionError) // return wrapped error description
+// fetchPublicationCatalog queries one catalog endpoint and yields the response body as a string
+func fetchPublicationCatalog(executionScopeContext context.Context, catalogToFetch publicationCatalog) (string, error) { // returns string body and error
+	hypertextTransferProtocolRequest, requestConstructionError := http.NewRequestWithContext(executionScopeContext, http.MethodGet, catalogToFetch.endpointUniformResourceLocator, nil) // build request with context
+	if requestConstructionError != nil {                                                                                                                                                // check whether request assembly failed
+		return "", fmt.Errorf("failed to construct request for catalog %s: %w", catalogToFetch.catalogName, requestConstructionError) // return wrapped error description
 	} // end request check
 
 	applyBrowserRequestHeaders(hypertextTransferProtocolRequest)   // attach browser headers to satisfy endpoint security
 	hypertextTransferProtocolRequest.Header.Set("TabId", "131")    // configure portal tab identifier
 	hypertextTransferProtocolRequest.Header.Set("ModuleId", "449") // configure target module identifier
 
-	slog.Info("Dispatching HTTP request to query the publication catalog", "endpoint", endpointUniformResourceLocator) // log catalog retrieval attempt
+	slog.Info("Dispatching HTTP request to query the publication catalog", "catalog", catalogToFetch.catalogName, "endpoint", catalogToFetch.endpointUniformResourceLocator) // log catalog retrieval attempt
 
 	hypertextTransferProtocolResponse, networkExchangeError := sharedHypertextTransferProtocolClient.Do(hypertextTransferProtocolRequest) // execute network operation
 	if networkExchangeError != nil {                                                                                                      // check whether network round-trip failed
-		return "", fmt.Errorf("failed to retrieve publication index data: %w", networkExchangeError) // return wrapped transport error
+		return "", fmt.Errorf("failed to retrieve data for catalog %s: %w", catalogToFetch.catalogName, networkExchangeError) // return wrapped transport error
 	} // end network error check
 	defer hypertextTransferProtocolResponse.Body.Close() // guarantee deferred release of TCP network socket
 
 	if hypertextTransferProtocolResponse.StatusCode != http.StatusOK { // verify receipt of standard HTTP 200 status
-		return "", fmt.Errorf("server answered with unexpected HTTP status: %s", hypertextTransferProtocolResponse.Status) // report non-200 status code
+		return "", fmt.Errorf("catalog %s answered with unexpected HTTP status: %s", catalogToFetch.catalogName, hypertextTransferProtocolResponse.Status) // report non-200 status code
 	} // end status verification
 
 	responseByteData, payloadReadError := io.ReadAll(hypertextTransferProtocolResponse.Body) // slurp complete response stream
 	if payloadReadError != nil {                                                             // verify successful stream completion
-		return "", fmt.Errorf("failed to read publication catalog body: %w", payloadReadError) // report read failure
+		return "", fmt.Errorf("failed to read body of catalog %s: %w", catalogToFetch.catalogName, payloadReadError) // report read failure
 	} // end stream read check
 
 	return string(responseByteData), nil // convert raw bytes into character sequence and return
-} // end of fetchAirForceDepartmentalAllPublications function
+} // end of fetchPublicationCatalog function
 
-// Remove all the duplicates from a slice and return the slice.
-func removeDuplicatesFromSlice(slice []string) []string {
-	check := make(map[string]bool)
-	var newReturnSlice []string
-	for _, content := range slice {
-		if !check[content] {
-			check[content] = true
-			newReturnSlice = append(newReturnSlice, content)
-		}
-	}
-	return newReturnSlice
-}
+// removeDuplicatesFromSlice removes repeated strings from a slice while keeping the original order
+func removeDuplicatesFromSlice(originalStrings []string) []string { // accepts a slice that may hold duplicates
+	alreadySeenStrings := make(map[string]bool)              // map that remembers every string already kept
+	uniqueStrings := make([]string, 0, len(originalStrings)) // preallocate the result slice with enough capacity
+	for _, currentString := range originalStrings {          // walk every string in the original order
+		if !alreadySeenStrings[currentString] { // check whether this string has not been kept yet
+			alreadySeenStrings[currentString] = true             // mark this string as seen
+			uniqueStrings = append(uniqueStrings, currentString) // keep the first occurrence
+		} // end of the first-occurrence check
+	} // end of the iteration over original strings
+	return uniqueStrings // return the de-duplicated slice
+} // end of removeDuplicatesFromSlice function
 
 // extractPortableDocumentFormatUniformResourceLocators filters and deduplicates all PDF references
 func extractPortableDocumentFormatUniformResourceLocators(rawPayloadContent string) []string { // accepts raw string and outputs slice
@@ -112,12 +155,14 @@ func extractFilenameFromUniformResourceLocator(targetUniformResourceLocator stri
 
 // downloadPortableDocumentFormatFile downloads and saves a single document while generating a hash digest
 func downloadPortableDocumentFormatFile(executionScopeContext context.Context, targetUniformResourceLocator string, targetDestinationDirectory string) (string, error) { // downloads and persists file
-	targetFilename, filenameExtractionError := extractFilenameFromUniformResourceLocator(targetUniformResourceLocator) // extract file name
-	if filenameExtractionError != nil {                                                                                // verify valid file name
+	rawFilename, filenameExtractionError := extractFilenameFromUniformResourceLocator(targetUniformResourceLocator) // extract the raw file name from the URL
+	if filenameExtractionError != nil {                                                                             // verify valid file name
 		return "", filenameExtractionError // return extraction error
 	} // end error verification
 
-	finalDestinationPath := filepath.Join(targetDestinationDirectory, targetFilename) // assemble full system target path
+	safeFilename := buildSafePortableDocumentFormatFilename(rawFilename) // convert the raw name into a valid name following the naming rules
+
+	finalDestinationPath := filepath.Join(targetDestinationDirectory, safeFilename) // assemble full system target path
 
 	if _, fileStatisticsError := os.Stat(finalDestinationPath); fileStatisticsError == nil { // check if file is already on disk
 		return "skipped (file already exists)", nil // skip network download
@@ -210,13 +255,27 @@ func main() { // application execution entrypoint
 
 	slog.Info("Initializing Air Force publication harvesting process") // log application start
 
-	publicationIndexPayload, catalogFetchError := fetchAirForceDepartmentalAllPublications(applicationScopeContext) // retrieve catalog data
-	if catalogFetchError != nil {                                                                                   // check if index fetch failed
-		log.Fatalf("Fatal execution abort: %v", catalogFetchError) // log error and exit using standard log package
-	} // end error check
+	for catalogIndex, currentCatalog := range publicationCatalogsInProcessingOrder { // process each catalog in order, one at a time
+		if applicationScopeContext.Err() != nil { // check if an interrupt arrived before starting the next catalog
+			slog.Warn("Catalog processing aborted due to context cancellation", "reason", applicationScopeContext.Err()) // log cancellation event
+			break                                                                                                        // stop processing remaining catalogs
+		} // end cancellation check
 
-	discoveredUniformResourceLocators := extractPortableDocumentFormatUniformResourceLocators(publicationIndexPayload) // parse out target links
-	slog.Info("Discovered unique PDF publication endpoints", "count", len(discoveredUniformResourceLocators))          // print link count
+		slog.Info("Starting catalog", "position", catalogIndex+1, "total_catalogs", len(publicationCatalogsInProcessingOrder), "catalog", currentCatalog.catalogName) // log which catalog is starting
 
-	downloadAllPortableDocumentFormatFiles(applicationScopeContext, discoveredUniformResourceLocators, targetDestinationDirectory) // start sequential downloads
+		publicationIndexPayload, catalogFetchError := fetchPublicationCatalog(applicationScopeContext, currentCatalog) // retrieve catalog data for this API
+		if catalogFetchError != nil {                                                                                  // check if index fetch failed
+			slog.Error("Catalog fetch failed, moving to the next catalog", "catalog", currentCatalog.catalogName, "error", catalogFetchError) // log the failure without stopping the program
+			continue                                                                                                                          // skip to the next catalog
+		} // end error check
+
+		discoveredUniformResourceLocators := extractPortableDocumentFormatUniformResourceLocators(publicationIndexPayload)                               // parse out target links
+		slog.Info("Discovered unique PDF publication endpoints", "catalog", currentCatalog.catalogName, "count", len(discoveredUniformResourceLocators)) // print link count
+
+		downloadAllPortableDocumentFormatFiles(applicationScopeContext, discoveredUniformResourceLocators, targetDestinationDirectory) // download everything from this catalog before the loop moves on
+
+		slog.Info("Finished catalog", "catalog", currentCatalog.catalogName) // log that this catalog is fully done
+	} // end of catalog loop
+
+	slog.Info("All catalogs processed") // log completion of the whole run
 } // end of main function
