@@ -41,6 +41,10 @@ var publicationCatalogsInProcessingOrder = []publicationCatalog{ // ordered slic
 		catalogName:                    "UnitedStatesSpaceForceCombatForcesCommandAllPublications",                                                       // label for the third API
 		endpointUniformResourceLocator: "https://www.e-publishing.af.mil/DesktopModules/MVC/EPUBS/EPUB/GetPubsBySeriesView/?orgID=47&catID=20&series=-1", // third API address
 	}, // end of third catalog entry
+	{ // fourth catalog entry
+		catalogName:                    "UnitedStatesSpaceForceHeadquartersSpaceForceAllPublications",                                                       // label for the fourth API
+		endpointUniformResourceLocator: "https://www.e-publishing.af.mil/DesktopModules/MVC/EPUBS/EPUB/GetPubsBySeriesView/?orgID=16498&catID=20&series=-1", // fourth API address
+	}, // end of fourth catalog entry
 } // end of the catalog list
 
 // portableDocumentFormatRegularExpression locates target PDF URLs inside raw catalog HTML
