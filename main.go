@@ -4,6 +4,7 @@ import ( // start of the standard library import block
 	"context"       // package for context management, request cancellation, and timeouts
 	"crypto/sha256" // package for generating SHA-256 cryptographic check values
 	"encoding/hex"  // package for converting binary byte hashes into readable strings
+	"encoding/json" // package for converting the HAR file text into Go data structures
 	"errors"        // package for inspecting and comparing standard error values
 	"fmt"           // package for formatted input and output string operations
 	"io"            // package for foundational sequential data stream interactions
@@ -16,10 +17,28 @@ import ( // start of the standard library import block
 	"path"          // package for manipulating standard forward-slash separated path segments
 	"path/filepath" // package for handling native file system path syntax across platforms
 	"regexp"        // package supporting pattern-based regular expression search operations
+	"sort"          // package for putting the discovered catalog addresses in a stable order
 	"strings"       // package providing helper utilities for string searching and manipulation
 	"syscall"       // package containing low-level operating system primitives and signal constants
 	"time"          // package providing utilities for durations, clocks, and timeouts
 ) // end of the standard library import block
+
+// harFilePath is the location of the HAR file; change this value to point at your own file
+const harFilePath = "download.har" // path to the HAR file that is scanned for catalog addresses
+
+// targetDestinationDirectory is the folder where every downloaded PDF is saved
+const targetDestinationDirectory = "PDFs" // local folder that is created automatically if it does not exist
+
+// harFileStructure describes only the parts of the HAR file that this program needs
+type harFileStructure struct { // top-level HAR layout
+	Log struct { // the "log" object inside the HAR file
+		Entries []struct { // the "entries" list, where each entry is one recorded network request
+			Request struct { // the "request" object inside one entry
+				RequestedUniformResourceLocator string `json:"url"` // the full address the browser requested
+			} `json:"request"` // end of the request object, linked to the "request" JSON key
+		} `json:"entries"` // end of the entries list, linked to the "entries" JSON key
+	} `json:"log"` // end of the log object, linked to the "log" JSON key
+} // end of harFileStructure type
 
 // publicationCatalog describes one catalog API that lists publications
 type publicationCatalog struct { // holds the settings needed to query a single catalog
@@ -27,25 +46,8 @@ type publicationCatalog struct { // holds the settings needed to query a single 
 	endpointUniformResourceLocator string // full API address that returns the catalog payload
 } // end of publicationCatalog type
 
-// publicationCatalogsInProcessingOrder lists every catalog; each one is fully downloaded before the next starts
-var publicationCatalogsInProcessingOrder = []publicationCatalog{ // ordered slice so the first API always runs first
-	{ // first catalog entry
-		catalogName:                    "AirForceDepartmentalPublications",                                                                                 // label for the first API
-		endpointUniformResourceLocator: "https://www.e-publishing.af.mil/DesktopModules/MVC/EPUBS/EPUB/GetPubsBySeriesView/?orgID=10141&catID=1&series=-1", // first API address
-	}, // end of first catalog entry
-	{ // second catalog entry
-		catalogName:                    "AirNationalGuardAllPublications",                                                                                // label for the second API
-		endpointUniformResourceLocator: "https://www.e-publishing.af.mil/DesktopModules/MVC/EPUBS/EPUB/GetPubsBySeriesView/?orgID=44&catID=16&series=-1", // second API address
-	}, // end of second catalog entry
-	{ // third catalog entry
-		catalogName:                    "UnitedStatesSpaceForceCombatForcesCommandAllPublications",                                                       // label for the third API
-		endpointUniformResourceLocator: "https://www.e-publishing.af.mil/DesktopModules/MVC/EPUBS/EPUB/GetPubsBySeriesView/?orgID=47&catID=20&series=-1", // third API address
-	}, // end of third catalog entry
-	{ // fourth catalog entry
-		catalogName:                    "UnitedStatesSpaceForceHeadquartersSpaceForceAllPublications",                                                       // label for the fourth API
-		endpointUniformResourceLocator: "https://www.e-publishing.af.mil/DesktopModules/MVC/EPUBS/EPUB/GetPubsBySeriesView/?orgID=16498&catID=20&series=-1", // fourth API address
-	}, // end of fourth catalog entry
-} // end of the catalog list
+// catalogEndpointRegularExpression matches catalog addresses with numeric orgID, catID and series values
+var catalogEndpointRegularExpression = regexp.MustCompile(`^https://www\.e-publishing\.af\.mil/DesktopModules/MVC/EPUBS/EPUB/GetPubsBySeriesView/\?orgID=\d+&catID=\d+&series=-?\d+$`) // compiled once during application startup
 
 // portableDocumentFormatRegularExpression locates target PDF URLs inside raw catalog HTML
 var portableDocumentFormatRegularExpression = regexp.MustCompile(`(?i)https?://[^"'\s<>\\]+\.pdf`) // compiled once during application startup
@@ -63,6 +65,46 @@ const portableDocumentFormatExtension = ".pdf" // lowercase extension, valid for
 var sharedHypertextTransferProtocolClient = &http.Client{ // configure globally accessible HTTP client
 	Timeout: 180 * time.Second, // establish client-side network timeout ceiling
 } // finish HTTP client configuration
+
+// findPublicationCatalogsInHarFile reads the HAR file and returns one catalog for every unique matching address
+func findPublicationCatalogsInHarFile(pathToHarFile string) ([]publicationCatalog, error) { // returns the catalogs and any error
+	harFileBytes, harFileReadError := os.ReadFile(pathToHarFile) // read the entire HAR file from disk into memory
+	if harFileReadError != nil {                                 // check whether reading the file failed
+		return nil, fmt.Errorf("failed to read HAR file %s: %w", pathToHarFile, harFileReadError) // return the wrapped read error
+	} // end read error check
+
+	var parsedHarFile harFileStructure                                // empty structure that the JSON data will be filled into
+	harFileParseError := json.Unmarshal(harFileBytes, &parsedHarFile) // convert the raw bytes into the structure
+	if harFileParseError != nil {                                     // check whether the JSON could not be parsed
+		return nil, fmt.Errorf("failed to parse HAR file %s: %w", pathToHarFile, harFileParseError) // return the wrapped parse error
+	} // end parse error check
+
+	addressesAlreadySeen := make(map[string]bool) // lookup table that remembers which addresses were already collected
+	var uniqueCatalogAddresses []string           // list that will hold the unique matching addresses
+
+	for _, harEntry := range parsedHarFile.Log.Entries { // visit every network request recorded in the HAR file
+		requestedAddress := harEntry.Request.RequestedUniformResourceLocator                                           // copy the requested address into a clearly named variable
+		if catalogEndpointRegularExpression.MatchString(requestedAddress) && !addressesAlreadySeen[requestedAddress] { // keep only matching addresses that are new
+			addressesAlreadySeen[requestedAddress] = true                             // remember that this address has now been seen
+			uniqueCatalogAddresses = append(uniqueCatalogAddresses, requestedAddress) // add the address to the result list
+		} // end of the matching and new address check
+	} // end of the loop over HAR entries
+
+	sort.Strings(uniqueCatalogAddresses) // sort alphabetically so the processing order is always the same
+
+	catalogsFoundInHarFile := make([]publicationCatalog, 0, len(uniqueCatalogAddresses)) // preallocate the catalog list
+	for _, catalogAddress := range uniqueCatalogAddresses {                              // walk every unique address
+		catalogLabel := catalogAddress                                       // default label is the whole address in case parsing fails
+		parsedCatalogAddress, addressParseError := url.Parse(catalogAddress) // split the address into its parts
+		if addressParseError == nil {                                        // check whether parsing worked
+			queryParameters := parsedCatalogAddress.Query()                                                                                                      // read the query parameters (orgID, catID, series)
+			catalogLabel = fmt.Sprintf("orgID_%s_catID_%s_series_%s", queryParameters.Get("orgID"), queryParameters.Get("catID"), queryParameters.Get("series")) // build a readable label from the parameters
+		} // end of the address parse check
+		catalogsFoundInHarFile = append(catalogsFoundInHarFile, publicationCatalog{catalogName: catalogLabel, endpointUniformResourceLocator: catalogAddress}) // store the catalog
+	} // end of the loop over unique addresses
+
+	return catalogsFoundInHarFile, nil // return the catalogs and no error
+} // end of findPublicationCatalogsInHarFile function
 
 // buildSafePortableDocumentFormatFilename converts any raw name into a valid PDF file name.
 // Rules: only 0-9, a-z and _ are allowed, no leading or trailing _, and no repeated __.
@@ -158,7 +200,7 @@ func extractFilenameFromUniformResourceLocator(targetUniformResourceLocator stri
 } // end of extractFilenameFromUniformResourceLocator function
 
 // downloadPortableDocumentFormatFile downloads and saves a single document while generating a hash digest
-func downloadPortableDocumentFormatFile(executionScopeContext context.Context, targetUniformResourceLocator string, targetDestinationDirectory string) (string, error) { // downloads and persists file
+func downloadPortableDocumentFormatFile(executionScopeContext context.Context, targetUniformResourceLocator string, destinationDirectory string) (string, error) { // downloads and persists file
 	rawFilename, filenameExtractionError := extractFilenameFromUniformResourceLocator(targetUniformResourceLocator) // extract the raw file name from the URL
 	if filenameExtractionError != nil {                                                                             // verify valid file name
 		return "", filenameExtractionError // return extraction error
@@ -166,7 +208,7 @@ func downloadPortableDocumentFormatFile(executionScopeContext context.Context, t
 
 	safeFilename := buildSafePortableDocumentFormatFilename(rawFilename) // convert the raw name into a valid name following the naming rules
 
-	finalDestinationPath := filepath.Join(targetDestinationDirectory, safeFilename) // assemble full system target path
+	finalDestinationPath := filepath.Join(destinationDirectory, safeFilename) // assemble full system target path
 
 	if _, fileStatisticsError := os.Stat(finalDestinationPath); fileStatisticsError == nil { // check if file is already on disk
 		return "skipped (file already exists)", nil // skip network download
@@ -221,12 +263,12 @@ func downloadPortableDocumentFormatFile(executionScopeContext context.Context, t
 } // end of downloadPortableDocumentFormatFile function
 
 // downloadAllPortableDocumentFormatFiles sequentially downloads all discovered PDF files
-func downloadAllPortableDocumentFormatFiles(executionScopeContext context.Context, uniformResourceLocators []string, targetDestinationDirectory string) { // executes sequential downloads
-	if directoryCreationError := os.MkdirAll(targetDestinationDirectory, 0o755); directoryCreationError != nil { // create destination directory
-		log.Fatalf("Fatal error: Failed to create target output directory %s: %v", targetDestinationDirectory, directoryCreationError) // terminate on disk error
+func downloadAllPortableDocumentFormatFiles(executionScopeContext context.Context, uniformResourceLocators []string, destinationDirectory string) { // executes sequential downloads
+	if directoryCreationError := os.MkdirAll(destinationDirectory, 0o755); directoryCreationError != nil { // create destination directory
+		log.Fatalf("Fatal error: Failed to create target output directory %s: %v", destinationDirectory, directoryCreationError) // terminate on disk error
 	} // end directory verification
 
-	slog.Info("Starting sequential download process", "directory", targetDestinationDirectory, "total_files", len(uniformResourceLocators)) // report start of downloads
+	slog.Info("Starting sequential download process", "directory", destinationDirectory, "total_files", len(uniformResourceLocators)) // report start of downloads
 
 	for index, currentTargetUniformResourceLocator := range uniformResourceLocators { // iterate over every discovered URL sequentially
 		if executionScopeContext.Err() != nil { // check if OS interrupt signal cancelled the context
@@ -234,8 +276,8 @@ func downloadAllPortableDocumentFormatFiles(executionScopeContext context.Contex
 			break                                                                                                 // exit loop cleanly
 		} // end cancellation check
 
-		downloadResultStatus, downloadEncounteredError := downloadPortableDocumentFormatFile(executionScopeContext, currentTargetUniformResourceLocator, targetDestinationDirectory) // execute download
-		if downloadEncounteredError != nil {                                                                                                                                         // check if error occurred
+		downloadResultStatus, downloadEncounteredError := downloadPortableDocumentFormatFile(executionScopeContext, currentTargetUniformResourceLocator, destinationDirectory) // execute download
+		if downloadEncounteredError != nil {                                                                                                                                   // check if error occurred
 			slog.Error("File download failed", "index", index+1, "url", currentTargetUniformResourceLocator, "error", downloadEncounteredError) // log structured error
 		} else { // download finished without issues
 			slog.Info("File processed", "index", index+1, "status", downloadResultStatus, "url", currentTargetUniformResourceLocator) // log structured status
@@ -246,8 +288,6 @@ func downloadAllPortableDocumentFormatFiles(executionScopeContext context.Contex
 } // end of downloadAllPortableDocumentFormatFiles function
 
 func main() { // application execution entrypoint
-	targetDestinationDirectory := "PDFs" // define default local filesystem directory where files are saved
-
 	log.SetFlags(log.Ldate | log.Ltime | log.Lshortfile | log.Lmsgprefix) // configure standard logger with date, time, file line, and prefix
 	log.SetPrefix("[AirForce-Downloader] ")                               // configure prefix label on every log entry
 
@@ -257,9 +297,20 @@ func main() { // application execution entrypoint
 	applicationScopeContext, stopSignalListener := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM) // build root context listening for Ctrl+C and termination signals
 	defer stopSignalListener()                                                                                               // guarantee signal listener cleanup on program exit
 
-	slog.Info("Initializing Air Force publication harvesting process") // log application start
+	slog.Info("Initializing Air Force publication harvesting process", "har_file", harFilePath) // log application start
 
-	for catalogIndex, currentCatalog := range publicationCatalogsInProcessingOrder { // process each catalog in order, one at a time
+	publicationCatalogsInProcessingOrder, harScanError := findPublicationCatalogsInHarFile(harFilePath) // step 1: scan the HAR file for every catalog address
+	if harScanError != nil {                                                                            // check whether the HAR file could not be read or parsed
+		log.Fatalf("Fatal error: %v", harScanError) // print the error and stop the program
+	} // end HAR scan error check
+
+	slog.Info("Catalog addresses found in the HAR file", "count", len(publicationCatalogsInProcessingOrder)) // log how many catalogs the HAR file contained
+	if len(publicationCatalogsInProcessingOrder) == 0 {                                                      // check whether nothing matched
+		slog.Warn("No matching catalog addresses were found, nothing to download") // tell the user why the program is stopping
+		return                                                                     // exit because there is no work to do
+	} // end empty result check
+
+	for catalogIndex, currentCatalog := range publicationCatalogsInProcessingOrder { // step 2: process each catalog in order, one at a time
 		if applicationScopeContext.Err() != nil { // check if an interrupt arrived before starting the next catalog
 			slog.Warn("Catalog processing aborted due to context cancellation", "reason", applicationScopeContext.Err()) // log cancellation event
 			break                                                                                                        // stop processing remaining catalogs
@@ -276,7 +327,7 @@ func main() { // application execution entrypoint
 		discoveredUniformResourceLocators := extractPortableDocumentFormatUniformResourceLocators(publicationIndexPayload)                               // parse out target links
 		slog.Info("Discovered unique PDF publication endpoints", "catalog", currentCatalog.catalogName, "count", len(discoveredUniformResourceLocators)) // print link count
 
-		downloadAllPortableDocumentFormatFiles(applicationScopeContext, discoveredUniformResourceLocators, targetDestinationDirectory) // download everything from this catalog before the loop moves on
+		downloadAllPortableDocumentFormatFiles(applicationScopeContext, discoveredUniformResourceLocators, targetDestinationDirectory) // step 3: download every PDF from this catalog before the loop moves on
 
 		slog.Info("Finished catalog", "catalog", currentCatalog.catalogName) // log that this catalog is fully done
 	} // end of catalog loop
