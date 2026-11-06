@@ -1215,7 +1215,7 @@ async def main() -> None:  # Program entry point
                 user_data_dir=str(
                     BROWSER_PROFILE_DIRECTORY
                 ),  # Keep the cache and cookies in this folder instead of in memory
-                headless=False,  # Show the browser window
+                headless=True,  # Show the browser window
                 args=["--start-maximized"],  # Open the window maximized
                 no_viewport=True,  # Let the pages fill the maximized window instead of a fixed size
             )  # End of the launch options
