@@ -1,7 +1,10 @@
 """Crawl every category and subcategory on e-publishing.af.mil with 2 tabs, a HAR file and one SQLite database."""  # Module docstring describing what the script does
 
 import asyncio  # Standard library package that runs the two workers at the same time
+import base64  # Standard library package for storing binary response bodies inside the HAR file
+import hashlib  # Standard library package for recognizing identical response bodies
 import contextvars  # Standard library package that lets each worker tag its own log lines
+import json  # Standard library package for writing headers and HAR entries
 import logging  # Standard library package for progress and debug messages
 import re  # Standard library package for parsing ids out of onclick attributes
 import sqlite3  # Standard library package for the SQLite progress database
@@ -9,6 +12,7 @@ import sys  # Standard library package so log messages can go to the console
 from dataclasses import dataclass  # Standard library package for small, readable data holders
 from datetime import datetime, timezone  # Standard library packages for UTC timestamps
 from pathlib import Path  # Standard library package for safe file paths
+from urllib.parse import parse_qsl, urlsplit  # Standard library package for splitting URLs into query parameters
 
 from playwright.async_api import ConsoleMessage  # Type hint for browser console messages
 from playwright.async_api import Error as PlaywrightError  # Base class of every Playwright error, timeouts included
@@ -21,6 +25,8 @@ from playwright.async_api import async_playwright  # Entry point of the asynchro
 PRODUCT_INDEX_URL = "https://www.e-publishing.af.mil/Product-Index/"  # Page where every crawl starts
 TOP_LEVEL_MENU_TITLES = ["Publications", "Forms"]  # The two column headings on the Product Index page
 DATABASE_FILE_PATH = Path("state.db")  # The one and only database, remembering progress between runs
+RECORDED_URL_PREFIX = "https://www.e-publishing.af.mil/"  # Only responses from this site are recorded
+RECORDED_RESOURCE_TYPES = {"document", "xhr", "fetch"}  # Pages and AJAX calls are recorded; fonts, images, CSS and scripts are not
 BROWSER_PROFILE_DIRECTORY = Path("browser_profile")  # Folder where Chromium keeps its cache and cookies on disk
 WORKER_COUNT = 10  # How many tabs crawl at the same time, all inside one Chromium window
 WAIT_FOR_OTHER_WORKERS_SECONDS = 1.0  # How long an idle worker waits before asking the database for work again
@@ -82,6 +88,71 @@ class Subcategory:  # One subcategory link such as "Departmental"
     subcategory_name: str  # The visible text, for example "Departmental"
 
 
+@dataclass  # Generate the constructor automatically
+class NetworkEntry:  # One recorded request and response pair
+    started_at: str  # When the response arrived, as an ISO timestamp
+    duration_ms: float  # How long the request took in milliseconds
+    method: str  # HTTP method such as GET or POST
+    url: str  # The requested URL
+    resource_type: str  # document, xhr or fetch
+    request_headers: dict[str, str]  # Headers the browser sent
+    request_post_data: str | None  # The request body, if there was one
+    status: int  # HTTP status code
+    status_text: str  # HTTP status text
+    response_headers: dict[str, str]  # Headers the server sent
+    mime_type: str  # Content-Type of the response
+    body: bytes  # The response body
+
+
+def to_har_headers(headers: dict[str, str]) -> list[dict[str, str]]:  # Convert a header dictionary to the HAR list format
+    return [{"name": name, "value": value} for name, value in headers.items()]  # One name/value pair per header
+
+
+def build_har_entry(row: sqlite3.Row) -> dict:  # Turn one database row into one HAR entry
+    request_headers = json.loads(row["request_headers"])  # Read the stored request headers
+    response_headers = json.loads(row["response_headers"])  # Read the stored response headers
+    body = row["body"] or b""  # The stored body, or nothing for empty responses
+    content = {"size": row["body_size"], "mimeType": row["mime_type"]}  # Describe the response content
+    try:  # Text bodies are stored as plain text
+        content["text"] = body.decode("utf-8")  # Decode the body as UTF-8
+    except UnicodeDecodeError:  # Binary bodies are stored as base64
+        content["text"] = base64.b64encode(body).decode("ascii")  # Encode the body as base64 text
+        content["encoding"] = "base64"  # Tell HAR readers how to decode it
+    request = {  # Describe the request
+        "method": row["method"],  # HTTP method
+        "url": row["url"],  # Requested URL
+        "httpVersion": "HTTP/1.1",  # The real version is not recorded
+        "cookies": [],  # Cookies are not recorded separately
+        "headers": to_har_headers(request_headers),  # Request headers
+        "queryString": [{"name": name, "value": value} for name, value in parse_qsl(urlsplit(row["url"]).query)],  # Query parameters
+        "headersSize": -1,  # Unknown
+        "bodySize": len(row["request_post_data"].encode("utf-8")) if row["request_post_data"] else 0,  # Size of the request body
+    }  # End of the request
+    if row["request_post_data"] is not None:  # Only add post data when there is some
+        request["postData"] = {"mimeType": request_headers.get("content-type", ""), "text": row["request_post_data"]}  # Request body
+    response = {  # Describe the response
+        "status": row["status"],  # HTTP status code
+        "statusText": row["status_text"],  # HTTP status text
+        "httpVersion": "HTTP/1.1",  # The real version is not recorded
+        "cookies": [],  # Cookies are not recorded separately
+        "headers": to_har_headers(response_headers),  # Response headers
+        "content": content,  # Response body
+        "redirectURL": response_headers.get("location", ""),  # Where a redirect points to
+        "headersSize": -1,  # Unknown
+        "bodySize": row["body_size"],  # Size of the response body
+    }  # End of the response
+    return {  # Assemble the entry
+        "startedDateTime": row["started_at"],  # When it happened
+        "time": row["duration_ms"],  # How long it took
+        "request": request,  # The request
+        "response": response,  # The response
+        "cache": {},  # Cache details are not recorded
+        "timings": {"send": 0, "wait": row["duration_ms"], "receive": 0},  # Only the total time is known
+        "_workerLabel": row["worker_label"],  # Custom field: which worker's tab made the request
+        "_resourceType": row["resource_type"],  # Custom field: document, xhr or fetch
+    }  # End of the entry
+
+
 def current_utc_timestamp() -> str:  # Give the current time in a sortable text format
     return datetime.now(timezone.utc).isoformat(timespec="seconds")  # For example 2026-11-05T14:30:00+00:00
 
@@ -131,7 +202,33 @@ class CrawlDatabase:  # Remembers every category, subcategory, run and error, an
             "last_run_id INTEGER REFERENCES crawl_runs(run_id), "  # Which run visited it last
             "PRIMARY KEY (category_id, organization_id))"  # One row per category and organization pair
         )  # End of the subcategories table SQL
+        create_network_bodies_sql = (  # SQL that creates the table of response bodies
+            "CREATE TABLE IF NOT EXISTS network_bodies ("  # Start of the bodies table
+            "body_hash TEXT PRIMARY KEY, "  # SHA-256 of the body, so identical bodies are stored only once
+            "body BLOB NOT NULL)"  # The response body itself
+        )  # End of the bodies table SQL
+        create_network_entries_sql = (  # SQL that creates the table of recorded requests
+            "CREATE TABLE IF NOT EXISTS network_entries ("  # Start of the entries table
+            "entry_id INTEGER PRIMARY KEY AUTOINCREMENT, "  # Order in which entries were recorded
+            "run_id INTEGER NOT NULL REFERENCES crawl_runs(run_id), "  # Which run recorded it
+            "worker_label TEXT NOT NULL, "  # Which worker's tab made the request
+            "started_at TEXT NOT NULL, "  # When it happened
+            "duration_ms REAL NOT NULL, "  # How long it took
+            "method TEXT NOT NULL, "  # HTTP method
+            "url TEXT NOT NULL, "  # Requested URL
+            "resource_type TEXT NOT NULL, "  # document, xhr or fetch
+            "request_headers TEXT NOT NULL, "  # Request headers as JSON
+            "request_post_data TEXT, "  # Request body, if any
+            "status INTEGER NOT NULL, "  # HTTP status code
+            "status_text TEXT NOT NULL, "  # HTTP status text
+            "response_headers TEXT NOT NULL, "  # Response headers as JSON
+            "mime_type TEXT NOT NULL, "  # Content-Type of the response
+            "body_hash TEXT REFERENCES network_bodies(body_hash), "  # Link to the stored body
+            "body_size INTEGER NOT NULL)"  # Size of the body in bytes
+        )  # End of the entries table SQL
         with self.connection:  # Run all statements in one transaction
+            self.connection.execute(create_network_bodies_sql)  # Create the bodies table
+            self.connection.execute(create_network_entries_sql)  # Create the entries table
             self.connection.execute(create_runs_sql)  # Create the runs table
             self.connection.execute(create_categories_sql)  # Create the categories table
             self.connection.execute(create_subcategories_sql)  # Create the subcategories table
@@ -179,6 +276,48 @@ class CrawlDatabase:  # Remembers every category, subcategory, run and error, an
                 "UPDATE crawl_runs SET finished_at = ?, subcategories_visited = ?, subcategories_failed = ? WHERE run_id = ?",  # Statement
                 (current_utc_timestamp(), visited_count, failed_count, run_id),  # Values for the placeholders
             )  # End of the update
+
+    def save_network_entry(self, run_id: int, worker_label: str, entry: NetworkEntry) -> None:  # Store one request and response on disk right away
+        body_hash = hashlib.sha256(entry.body).hexdigest() if entry.body else None  # Fingerprint the body so duplicates are stored once
+        with self.connection:  # Save both inserts together
+            if body_hash is not None:  # Only store non-empty bodies
+                self.connection.execute("INSERT OR IGNORE INTO network_bodies (body_hash, body) VALUES (?, ?)", (body_hash, entry.body))  # Store the body once
+            self.connection.execute(  # Store the entry itself
+                "INSERT INTO network_entries (run_id, worker_label, started_at, duration_ms, method, url, resource_type, request_headers, "  # Columns, part 1
+                "request_post_data, status, status_text, response_headers, mime_type, body_hash, body_size) "  # Columns, part 2
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",  # One placeholder per column
+                (run_id, worker_label, entry.started_at, entry.duration_ms, entry.method, entry.url, entry.resource_type,  # Values, part 1
+                 json.dumps(entry.request_headers), entry.request_post_data, entry.status, entry.status_text,  # Values, part 2
+                 json.dumps(entry.response_headers), entry.mime_type, body_hash, len(entry.body)),  # Values, part 3
+            )  # End of the entry insert
+
+    def export_har(self, run_id: int, har_file_path: Path) -> int:  # Write a run's recorded traffic to a HAR file, one entry at a time
+        entry_count = 0  # Count the entries written
+        with har_file_path.open("w", encoding="utf-8") as har_file:  # Open the HAR file for writing
+            har_file.write('{"log": {"version": "1.2", "creator": {"name": "epubs_crawler", "version": "1.0"}, "entries": [')  # Start of the HAR document
+            cursor = self.connection.execute(  # Read the run's entries in order, without loading them all at once
+                "SELECT e.*, b.body AS body FROM network_entries AS e LEFT JOIN network_bodies AS b ON b.body_hash = e.body_hash "  # Entries with their bodies
+                "WHERE e.run_id = ? ORDER BY e.entry_id",  # Only this run, in recorded order
+                (run_id,),  # Value for the placeholder
+            )  # End of the query
+            for row in cursor:  # Handle one row at a time so memory use stays flat
+                if entry_count > 0:  # Entries after the first need a separating comma
+                    har_file.write(",")  # Write the separator
+                har_file.write(json.dumps(build_har_entry(row)))  # Write the entry straight to disk
+                entry_count += 1  # Count it
+            har_file.write("]}}")  # End of the HAR document
+        return entry_count  # Tell the caller how many entries were written
+
+    def export_missing_har_files(self) -> None:  # Rebuild HAR files of earlier runs that were killed before they could export
+        rows = self.connection.execute(  # Find runs that have recorded traffic
+            "SELECT run_id, har_file_path FROM crawl_runs WHERE har_file_path IS NOT NULL "  # Runs with a HAR path
+            "AND run_id IN (SELECT DISTINCT run_id FROM network_entries)"  # That have recorded entries
+        ).fetchall()  # Read all rows
+        for row in rows:  # Loop over those runs
+            har_file_path = Path(row["har_file_path"])  # The expected HAR file
+            if not har_file_path.exists():  # If the file was never written
+                entry_count = self.export_har(row["run_id"], har_file_path)  # Write it now from the database
+                logger.info("Rebuilt %s from the database (%d entries)", har_file_path, entry_count)  # Log the rebuild
 
     def save_categories(self, categories: list[Category]) -> None:  # Remember every category found on the index page
         rows = [(c.category_id, c.menu_title, c.category_name, current_utc_timestamp()) for c in categories]  # Build one row per category
@@ -293,7 +432,36 @@ class CrawlDatabase:  # Remembers every category, subcategory, run and error, an
         self.connection.close()  # Release the file
 
 
-def attach_debug_listeners(page: Page, worker_label: str) -> None:  # Hook the logging callbacks into the page events
+async def record_network_response(response: Response, worker_label: str, database: CrawlDatabase, run_id: int) -> None:  # Save one response to the database if it is worth keeping
+    request = response.request  # The request that produced this response
+    if request.resource_type not in RECORDED_RESOURCE_TYPES or not response.url.startswith(RECORDED_URL_PREFIX):  # Skip fonts, images, scripts and other sites
+        return  # Nothing to record
+    try:  # Recording must never break the crawl
+        try:  # Redirect responses have no body
+            body = await response.body()  # Read the response body
+        except PlaywrightError:  # If the body is unavailable
+            body = b""  # Record the response without a body
+        response_end = request.timing.get("responseEnd", -1)  # Milliseconds from the start of the request to the end of the response
+        entry = NetworkEntry(  # Collect everything about this response
+            started_at=datetime.now(timezone.utc).isoformat(timespec="milliseconds"),  # Time of recording
+            duration_ms=float(response_end) if response_end and response_end > 0 else 0.0,  # Request duration
+            method=request.method,  # HTTP method
+            url=response.url,  # URL
+            resource_type=request.resource_type,  # document, xhr or fetch
+            request_headers=await request.all_headers(),  # Headers the browser sent
+            request_post_data=request.post_data,  # Request body, if any
+            status=response.status,  # Status code
+            status_text=response.status_text,  # Status text
+            response_headers=await response.all_headers(),  # Headers the server sent
+            mime_type=response.headers.get("content-type", ""),  # Content type
+            body=body,  # Response body
+        )  # End of the entry
+        database.save_network_entry(run_id, worker_label, entry)  # Write it to disk immediately
+    except Exception:  # Any problem, including a closed tab
+        logger.warning("Could not record the response for %s", response.url, exc_info=True)  # Report it and keep crawling
+
+
+def attach_debug_listeners(page: Page, worker_label: str, database: CrawlDatabase, run_id: int) -> None:  # Hook logging and recording into the page events
     logger.debug("Attaching debug listeners to the page of %s", worker_label)  # Log that the listeners are being attached
 
     def on_console(message: ConsoleMessage) -> None:  # Callback for text the web page prints to its console
@@ -308,9 +476,10 @@ def attach_debug_listeners(page: Page, worker_label: str) -> None:  # Hook the l
         current_worker_label.set(worker_label)  # Tag the log line with the tab's worker
         logger.debug("Request  -> %s %s", request.method, request.url)  # Log the HTTP method and the URL
 
-    def on_response(response: Response) -> None:  # Callback for every incoming network response
+    async def on_response(response: Response) -> None:  # Callback for every incoming network response
         current_worker_label.set(worker_label)  # Tag the log line with the tab's worker
         logger.debug("Response <- %s %s", response.status, response.url)  # Log the status code and the URL
+        await record_network_response(response, worker_label, database, run_id)  # Save worthwhile responses to the database
 
     page.on("console", on_console)  # Log the page's console output
     page.on("pageerror", on_page_error)  # Log JavaScript errors from the page
@@ -437,17 +606,22 @@ async def crawl_subcategory(page: Page, category: Category, subcategory: Subcate
 
 
 async def list_category(page: Page, category: Category, database: CrawlDatabase) -> bool:  # Read and store the subcategories of one category; False means the tab is gone
+    settled = False  # Becomes True once the database knows how this category ended
     try:  # A problem in one category must not stop the whole crawl
         await open_product_index(page)  # Load the index page in this worker's tab
         await click_category(page, category)  # Open the category
         database.save_subcategories(category, await collect_subcategories(page, category))  # Read and remember its subcategories
+        settled = True  # The database now holds the result
         logger.info("Listed %s > %s", category.menu_title, category.category_name)  # Log success
     except PlaywrightError:  # If the category could not be opened or read
         if page.is_closed():  # If the tab or browser was closed, the category is not at fault
-            database.release_category(category)  # Give the category back without counting a failure
-            return False  # Tell the worker to stop
+            return False  # Tell the worker to stop; the finally block gives the category back
         logger.exception("Could not list category: %s > %s", category.menu_title, category.category_name)  # Log with traceback
         database.mark_listing_failed(category)  # Remember the failure so it is retried on the next run
+        settled = True  # The database now knows about the failure
+    finally:  # Runs on success, failure, cancellation and crashes alike
+        if not settled:  # If nothing recorded the outcome
+            database.release_category(category)  # Give the category back so nobody is stuck waiting for it
     return True  # The tab is still usable
 
 
@@ -462,18 +636,23 @@ async def run_worker(worker_id: int, page: Page, database: CrawlDatabase, run_id
         claimed_subcategory = database.claim_next_subcategory(worker_id, run_id)  # Ask for a subcategory nobody else has taken
         if claimed_subcategory is not None:  # If one was handed out
             category, subcategory = claimed_subcategory  # Unpack the claim
+            settled = False  # Becomes True once the database knows how this visit ended
             try:  # A problem in one subcategory must not stop the worker
                 viewed_all = await crawl_subcategory(page, category, subcategory)  # Visit it
                 database.mark_visited(category, subcategory, run_id, viewed_all)  # Remember that it is done
+                settled = True  # The database now holds the result
                 consecutive_failures = 0  # A success resets the counter
             except PlaywrightError as error:  # If anything went wrong on this path
                 if page.is_closed():  # If the tab or browser was closed, the subcategory is not at fault
-                    database.release_subcategory(category, subcategory)  # Give it back without counting an attempt
                     logger.error("The tab was closed, stopping this worker")  # Explain why
-                    break  # Stop this worker
+                    break  # Stop this worker; the finally block gives the subcategory back
                 logger.exception("Failed subcategory: %s > %s", category.category_name, subcategory.subcategory_name)  # Log with traceback
                 database.mark_failed(category, subcategory, run_id, str(error))  # Remember the failure so it can be retried later
+                settled = True  # The database now knows about the failure
                 consecutive_failures += 1  # Count the failure
+            finally:  # Runs on success, failure, cancellation and crashes alike
+                if not settled:  # If nothing recorded the outcome
+                    database.release_subcategory(category, subcategory)  # Give it back without counting an attempt
             continue  # Ask for more work
         category_to_list = database.claim_next_category_to_list()  # Ask for a category whose subcategories are still unknown
         if category_to_list is not None:  # If one was handed out
@@ -490,6 +669,7 @@ async def run_worker(worker_id: int, page: Page, database: CrawlDatabase, run_id
 
 async def main() -> None:  # Program entry point
     database = CrawlDatabase(DATABASE_FILE_PATH, MAX_ATTEMPTS)  # Open the one and only progress database
+    database.export_missing_har_files()  # Rebuild HAR files of earlier runs that were killed before exporting
     run_id = database.start_run()  # Record that a new run has begun
     har_file_path = Path(f"epubs_product_index_run{run_id}.har")  # Give every run its own HAR file so older ones are kept
     database.set_run_har_file_path(run_id, har_file_path)  # Remember which HAR file belongs to this run
@@ -501,8 +681,6 @@ async def main() -> None:  # Program entry point
                 headless=False,  # Show the browser window
                 args=["--start-maximized"],  # Open the window maximized
                 no_viewport=True,  # Let the pages fill the maximized window instead of a fixed size
-                record_har_path=str(har_file_path),  # Record all network traffic of all tabs to this run's HAR file
-                record_har_content="embed",  # Store the response bodies inside the HAR file
             )  # End of the launch options
             try:  # Make sure the HAR file is written even if something fails
                 browser_context.set_default_timeout(ACTION_TIMEOUT_MS)  # Apply the default wait to every action
@@ -510,7 +688,7 @@ async def main() -> None:  # Program entry point
                 while len(pages) < WORKER_COUNT:  # Every further worker gets a new tab, not a new browser
                     pages.append(await browser_context.new_page())  # Open the extra tab
                 for worker_number, page in enumerate(pages, start=1):  # Loop over all tabs with their worker numbers
-                    attach_debug_listeners(page, f"worker {worker_number}")  # Start logging console messages, errors and network traffic
+                    attach_debug_listeners(page, f"worker {worker_number}", database, run_id)  # Start logging and recording network traffic to the database
                 await open_product_index(pages[0])  # Load the starting page once to read the headings
                 categories = await collect_categories(pages[0])  # List every category under Publications and Forms
                 if not categories:  # If nothing was found, the page layout probably changed
@@ -521,14 +699,18 @@ async def main() -> None:  # Program entry point
                     for worker_number, page in enumerate(pages, start=1):  # Pair each tab with a worker number
                         task_group.create_task(run_worker(worker_number, page, database, run_id))  # Start the worker
             finally:  # Always run this cleanup
-                logger.debug("Closing the browser context to write the HAR file")  # Log the cleanup step
-                try:  # Closing can fail if the user already closed the window
-                    await browser_context.close()  # Closing the context writes the HAR file to disk and closes the browser
-                except PlaywrightError:  # If the context was already gone
+                logger.debug("Closing the browser context")  # Log the cleanup step
+                try:  # Closing can fail if the window or the Playwright driver is already gone
+                    await browser_context.close()  # Close the browser
+                except Exception:  # Playwright reports a dead driver with a plain Exception
                     logger.exception("Could not close the browser context cleanly")  # Report it without hiding the original error
-        logger.info("HAR saved to %s", har_file_path.resolve())  # Tell the user where the HAR file is
     finally:  # Always run this cleanup
         database.finish_run(run_id)  # Record the end time and totals of this run
+        try:  # A failed export must not hide the real error or skip the summary
+            entry_count = database.export_har(run_id, har_file_path)  # Write this run's recorded traffic to its HAR file, one entry at a time
+            logger.info("HAR saved to %s (%d entries)", har_file_path.resolve(), entry_count)  # Tell the user where the HAR file is
+        except Exception:  # Any problem while writing the file
+            logger.exception("Could not write the HAR file, the traffic is still in the database")  # The data is safe in state.db
         database.log_summary()  # Print the overall progress
         database.close()  # Close the database file
 
