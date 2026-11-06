@@ -56,7 +56,7 @@ RECORDED_RESOURCE_TYPES = {
 BROWSER_PROFILE_DIRECTORY = Path(
     "browser_profile"
 )  # Folder where Chromium keeps its cache and cookies on disk
-WORKER_COUNT = 2  # How many tabs crawl at the same time, all inside one Chromium window
+WORKER_COUNT = 10  # How many tabs crawl at the same time, all inside one Chromium window
 WAIT_FOR_OTHER_WORKERS_SECONDS = (
     1.0  # How long an idle worker waits before asking the database for work again
 )
