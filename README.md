@@ -567,8 +567,14 @@ source .venv/bin/activate
 # Activate Python Virtual Environment (Window)
 .venv\Scripts\activate
 
-# Install helpful libraries
-pip install pypdf pdfplumber pandas
+# Install helpful libraries using PIP
+pip install playwright
+
+# Install Playwright
+playwright install
+
+# Install Playwright Dependencies
+playwright install-deps
 ```
 
 ### Extract text from every PDF
