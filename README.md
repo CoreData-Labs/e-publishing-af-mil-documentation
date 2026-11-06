@@ -555,11 +555,17 @@ Process all PDFs to create a **CSV or JSON index** of titles, numbers, dates and
 ```bash
 # Clone the repository
 git clone https://github.com/PrajwalKoirala638/e-publishing-af-mil-documentation.git
+
 cd e-publishing-af-mil-documentation
 
 # Create a virtual environment
-python -m venv .venv
-source .venv/bin/activate        # Windows: .venv\Scripts\activate
+python3 -m venv .venv
+
+# Activate Python Virtual Environment (Linux)
+source .venv/bin/activate
+
+# Activate Python Virtual Environment (Window)
+.venv\Scripts\activate
 
 # Install helpful libraries
 pip install pypdf pdfplumber pandas
