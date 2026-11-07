@@ -75,7 +75,7 @@ RECORDED_RESOURCE_TYPES = {
     "fetch",
 }  # Pages and AJAX calls are recorded; fonts, images, CSS and scripts are not
 CONSOLE_LOG_LEVEL = (
-    logging.DEBUG
+    logging.INFO
 )  # The console stays readable; the log file always gets everything (DEBUG)
 WORKER_COUNT = (
     10  # How many tabs crawl at the same time, all inside one Chromium window
@@ -157,8 +157,10 @@ ORGANIZATION_ID_PATTERN = re.compile(
 )  # Capture the digits after SelectOrg(
 # Pattern that matches the "view all" control; it must START the text so a publication title that merely contains these words is not clicked
 VIEW_ALL_PATTERN = re.compile(
-    r"^\s*(view\s+all|all\s+publications?|all\s+forms?)", re.IGNORECASE
-)  # Match any "view all" wording at the start, ignoring case
+    r"^\s*(view\s+all|(\d+\s+)?all\s+(publications?|forms?))", re.IGNORECASE
+)  # Match "00 ALL PUBLICATIONS" (the number is optional) or "view all" at the start, ignoring case
+WAIT_FOR_RECORDING_SECONDS = 15.0  # After clicking "ALL PUBLICATIONS" the crawler waits at most this long for the GetPubsBySeriesView URL to be recorded, then moves on
+PUBS_BY_SERIES_PATH = "GetPubsBySeriesView"  # Path part of the URL that the "ALL PUBLICATIONS" click must produce
 AJAX_IDLE_SCRIPT = "() => !window.jQuery || window.jQuery.active === 0"  # JavaScript that is true when the page has no pending jQuery AJAX requests
 
 current_worker_label: contextvars.ContextVar[str] = contextvars.ContextVar(
@@ -1114,6 +1116,9 @@ class WorkerTab:  # One worker's browser tab, which can be replaced when it cras
         self.pending: set[
             asyncio.Task
         ] = set()  # Recordings that are still being processed for this tab
+        self.recorded_urls: list[
+            str
+        ] = []  # URLs this tab has handed to the writer during the current visit
         self.log = logging.LoggerAdapter(
             logger, {"worker": self.label}
         )  # Logger that always shows this worker's label
@@ -1284,6 +1289,14 @@ async def record_network_response(
                 body=body,  # Response body
             )  # End of the entry
         await tab.writer.add(tab.label, entry)  # Queue it for the database
+        tab.recorded_urls.append(entry.url)  # Remember that this URL reached the writer
+        tab.log.debug(
+            "Recorded %s %s (status %s, %d body bytes)",
+            entry.method,
+            entry.url,
+            entry.status,
+            len(entry.body),
+        )  # Log that it is in the HAR data
     except Exception:  # Any problem, including a closed tab or a timeout
         tab.log.warning(
             "Could not record the response for %s", response.url, exc_info=True
@@ -1599,11 +1612,30 @@ async def click_subcategory(
     await log_current_page(page)  # Log where we ended up
 
 
+def is_all_publications_url(
+    url: str, organization_id: int, category_id: int
+) -> bool:  # Check for a URL like .../GetPubsBySeriesView/?orgID=10141&catID=1&series=-1
+    parts = urlsplit(url)  # Split the URL into path and query
+    if (
+        PUBS_BY_SERIES_PATH.lower() not in parts.path.lower()
+    ):  # The path must contain GetPubsBySeriesView
+        return False  # Not the URL we are looking for
+    query = {
+        name.lower(): value for name, value in parse_qsl(parts.query)
+    }  # Query parameters with lower-case names, so the order and the capitals do not matter
+    return (
+        query.get("orgid") == str(organization_id)
+        and query.get("catid") == str(category_id)
+        and query.get("series") == "-1"
+    )  # Right organization, right category and series -1 (all publications)
+
+
 async def click_view_all_publications(
-    page: Page,
-) -> bool:  # Click the "view all" control if there is one
+    tab: WorkerTab, category: Category, subcategory: Subcategory
+) -> bool:  # Click "00 ALL PUBLICATIONS", wait until the GetPubsBySeriesView URL is recorded (at most 15 seconds) and leave
+    page = tab.page  # The tab of this worker
     logger.debug(
-        "Looking for the 'view all' control inside #org-list and #pub-list"
+        "Looking for the 'ALL PUBLICATIONS' control inside #org-list and #pub-list"
     )  # Log what we are looking for
     view_all_control = (
         page.locator("#org-list, #pub-list").get_by_text(VIEW_ALL_PATTERN).first
@@ -1613,37 +1645,71 @@ async def click_view_all_publications(
             state="visible", timeout=VIEW_ALL_TIMEOUT_MS
         )  # Wait for it to show up
     except PlaywrightTimeoutError:  # If it never showed up
-        logger.debug("'View all' control was not found")  # Log the miss
+        logger.debug("'ALL PUBLICATIONS' control was not found")  # Log the miss
         return False  # Tell the caller nothing was clicked
     control_text = " ".join(
         (await view_all_control.inner_text(timeout=ACTION_TIMEOUT_MS)).split()
     )  # Read the control's text so the log shows exactly what was clicked
-    logger.debug(
-        "Clicking the 'view all' control with text: %s", control_text[:200]
-    )  # Log it
+    logger.debug("Clicking the control with text: %s", control_text[:200])  # Log it
     await view_all_control.click(timeout=ACTION_TIMEOUT_MS)  # Click it
-    await wait_for_ajax_to_finish(
-        page
-    )  # Wait for the full list of publications to load
-    return True  # Tell the caller the click worked
+    loop = asyncio.get_running_loop()  # The event loop, used for its clock
+    deadline = loop.time() + WAIT_FOR_RECORDING_SECONDS  # The moment the waiting ends
+    while True:  # Keep checking until the URL is recorded or the time is up
+        recorded_url = next(
+            (
+                url
+                for url in tab.recorded_urls
+                if is_all_publications_url(
+                    url, subcategory.organization_id, category.category_id
+                )
+            ),
+            None,
+        )  # Look for the GetPubsBySeriesView URL among the recorded ones
+        if recorded_url is not None:  # It was recorded
+            logger.info(
+                "Recorded %s", recorded_url
+            )  # Log the exact URL that went into the HAR data
+            break  # Go to the next subcategory
+        if loop.time() >= deadline or state_stop_requested(
+            tab
+        ):  # Out of time (or the crawl is stopping)
+            logger.warning(
+                "GetPubsBySeriesView (orgID=%d, catID=%d, series=-1) was NOT recorded within %.0f seconds, moving on",
+                subcategory.organization_id,
+                category.category_id,
+                WAIT_FOR_RECORDING_SECONDS,
+            )  # Warn, then move on
+            break  # Go to the next subcategory
+        await asyncio.sleep(0.1)  # Check again in a moment
+    return True  # The click worked, so the visit is complete
+
+
+def state_stop_requested(
+    tab: WorkerTab,
+) -> bool:  # True when the tab is gone, so waiting is pointless
+    return (
+        tab.page is None or tab.page.is_closed() or tab.crashed
+    )  # Closed or crashed tabs will never record anything
 
 
 async def crawl_subcategory(
-    page: Page, category: Category, subcategory: Subcategory, state: CrawlState
-) -> bool:  # Visit one full path and report if "view all" was clicked
+    tab: WorkerTab, category: Category, subcategory: Subcategory, state: CrawlState
+) -> bool:  # Visit one full path and report if "ALL PUBLICATIONS" was clicked
+    page = tab.page  # The tab of this worker
     path_text = f"{category.menu_title} > {category.category_name} > {subcategory.subcategory_name}"  # Readable path
     logger.debug("Crawling: %s", path_text)  # Log the full path
+    tab.recorded_urls.clear()  # Forget the URLs of the previous visit
     await open_product_index(page, state)  # Start from a clean index page
     await click_category(page, category)  # Go into the category
     await click_subcategory(page, category, subcategory)  # Go into the subcategory
     viewed_all = await click_view_all_publications(
-        page
-    )  # Click "view all" if it exists
+        tab, category, subcategory
+    )  # Click "ALL PUBLICATIONS" if it exists
     if viewed_all:  # If the click worked
         logger.info("Viewed all: %s", path_text)  # Log success
     else:  # If the control was not found
         logger.info(
-            "No 'view all' control (this is normal), moving on: %s", path_text
+            "No 'ALL PUBLICATIONS' control (this is normal), moving on: %s", path_text
         )  # Log it calmly
     return viewed_all  # Tell the caller what happened
 
@@ -1758,7 +1824,7 @@ async def run_worker(
                     SUBCATEGORY_TIMEOUT_SECONDS
                 ):  # Never let one visit hang forever
                     viewed_all = await crawl_subcategory(
-                        tab.page, category, subcategory, state
+                        tab, category, subcategory, state
                     )  # Visit it
                 await tab.drain()  # Make sure the traffic of this visit is recorded before the tab moves on
                 database.mark_visited(
