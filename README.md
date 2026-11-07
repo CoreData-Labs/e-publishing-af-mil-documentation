@@ -3,7 +3,7 @@
 > A public, organized mirror of official U.S. Air Force and Department of the Air Force publications, instructions, manuals, handbooks and forms from the **Air Force e-Publishing** website, collected for **education, research, AI/ML study, professional development and community learning**.
 
 **Source website:** <https://www.e-publishing.af.mil/>
-**Repository:** <https://github.com/PrajwalKoirala638/e-publishing-af-mil-documentation>
+**Repository:** <https://github.com/CoreData-Labs/e-publishing-af-mil-documentation>
 **License:** MIT (for the repository's own scripts, structure and original text; see [Licensing and Legal Notes](#-licensing-and-legal-notes))
 
 ---
