@@ -75,7 +75,7 @@ RECORDED_RESOURCE_TYPES = {
     "fetch",
 }  # Pages and AJAX calls are recorded; fonts, images, CSS and scripts are not
 CONSOLE_LOG_LEVEL = (
-    logging.INFO
+    logging.DEBUG
 )  # The console stays readable; the log file always gets everything (DEBUG)
 WORKER_COUNT = (
     10  # How many tabs crawl at the same time, all inside one Chromium window
