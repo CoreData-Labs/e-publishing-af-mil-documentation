@@ -543,6 +543,9 @@ class CrawlDatabase:  # Remembers every category, subcategory, run and error, an
             self.add_column_if_missing(
                 "subcategories", "worker_id", "INTEGER"
             )  # Upgrade databases from older versions
+            self.add_column_if_missing(
+                "subcategories", "all_publications_url", "TEXT"
+            )  # The GetPubsBySeriesView URL that this subcategory's ALL PUBLICATIONS click produced
             category_columns = {
                 row["name"]
                 for row in self.connection.execute("PRAGMA table_info(categories)")
@@ -560,6 +563,9 @@ class CrawlDatabase:  # Remembers every category, subcategory, run and error, an
             self.connection.execute(
                 "CREATE INDEX IF NOT EXISTS idx_network_entries_run ON network_entries(run_id, entry_id)"
             )  # Makes the HAR export of one run fast
+            self.connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_network_entries_url ON network_entries(url)"
+            )  # Makes the final "is this URL really in the HAR data" check fast
 
     def add_column_if_missing(
         self, table_name: str, column_name: str, column_definition: str
@@ -887,18 +893,20 @@ class CrawlDatabase:  # Remembers every category, subcategory, run and error, an
         subcategory: Subcategory,
         run_id: int,
         viewed_all: bool,
-    ) -> None:  # Record a successful visit
+        all_publications_url: str | None,
+    ) -> None:  # Record a successful visit together with the URL its ALL PUBLICATIONS click produced
         status = (
             STATUS_VIEWED_ALL if viewed_all else STATUS_NO_VIEW_ALL
         )  # Choose the status from the result
         now = current_utc_timestamp()  # Take one timestamp for the whole update
         with self.connection:  # Save the change immediately
             self.connection.execute(  # Update the subcategory row
-                "UPDATE subcategories SET status = ?, attempts = attempts + 1, last_error = NULL, "  # First half of the statement
+                "UPDATE subcategories SET status = ?, attempts = attempts + 1, last_error = NULL, all_publications_url = ?, "  # First half of the statement
                 "first_visited_at = COALESCE(first_visited_at, ?), last_visited_at = ?, last_run_id = ? "  # Second half of the statement
                 "WHERE category_id = ? AND organization_id = ?",  # Which row to update
                 (
                     status,
+                    all_publications_url,
                     now,
                     now,
                     run_id,
@@ -906,6 +914,73 @@ class CrawlDatabase:  # Remembers every category, subcategory, run and error, an
                     subcategory.organization_id,
                 ),  # Values for the placeholders
             )  # End of the update
+
+    def verify_all_publications_urls(
+        self,
+    ) -> None:  # Prove that every ALL PUBLICATIONS click has its own matching URL in the recorded traffic
+        logger.info("---- Checking the GetPubsBySeriesView URLs ----")  # Heading
+        problems = 0  # Count everything that looks wrong
+        rows = self.connection.execute(
+            "SELECT category_id, organization_id, subcategory_name, status, all_publications_url FROM subcategories WHERE status IN (?, ?)",
+            (STATUS_VIEWED_ALL, STATUS_NO_VIEW_ALL),
+        ).fetchall()  # Every visited subcategory
+        with_url = 0  # Subcategories that have a stored URL
+        for row in rows:  # Check them one by one
+            if (
+                row["status"] == STATUS_VIEWED_ALL
+                and row["all_publications_url"] is None
+            ):  # Clicked, but the URL was never seen
+                problems += 1  # Count it
+                logger.warning(
+                    "No GetPubsBySeriesView URL was recorded for category %s > %s (orgID=%s)",
+                    row["category_id"],
+                    row["subcategory_name"],
+                    row["organization_id"],
+                )  # Name the subcategory
+            elif row["all_publications_url"] is not None:  # A URL is stored
+                with_url += 1  # Count it
+                if not is_all_publications_url(
+                    row["all_publications_url"],
+                    row["organization_id"],
+                    row["category_id"],
+                ):  # It must carry this subcategory's own ids
+                    problems += 1  # Count it
+                    logger.error(
+                        "The stored URL does not match category %s > %s: %s",
+                        row["category_id"],
+                        row["subcategory_name"],
+                        row["all_publications_url"],
+                    )  # Name the subcategory
+        duplicate_rows = self.connection.execute(
+            "SELECT all_publications_url, COUNT(*) AS total FROM subcategories WHERE all_publications_url IS NOT NULL GROUP BY all_publications_url HAVING COUNT(*) > 1"
+        ).fetchall()  # The same URL stored for more than one subcategory
+        for (
+            duplicate_row
+        ) in duplicate_rows:  # Every URL must belong to exactly one subcategory
+            problems += 1  # Count it
+            logger.error(
+                "The same URL is stored for %d subcategories: %s",
+                duplicate_row["total"],
+                duplicate_row["all_publications_url"],
+            )  # Show it
+        absent_rows = self.connection.execute(
+            "SELECT s.category_id, s.subcategory_name, s.all_publications_url FROM subcategories AS s WHERE s.all_publications_url IS NOT NULL AND NOT EXISTS (SELECT 1 FROM network_entries AS e WHERE e.url = s.all_publications_url)"
+        ).fetchall()  # Stored URLs that are missing from the recorded traffic
+        for (
+            absent_row
+        ) in absent_rows:  # Every stored URL must really be in the HAR data
+            problems += 1  # Count it
+            logger.error(
+                "The URL for category %s > %s is not in the recorded traffic: %s",
+                absent_row["category_id"],
+                absent_row["subcategory_name"],
+                absent_row["all_publications_url"],
+            )  # Show it
+        logger.info(
+            "GetPubsBySeriesView check: %d subcategories have a unique, matching, recorded URL; %d problems",
+            with_url - len(duplicate_rows) - len(absent_rows),
+            problems,
+        )  # Final result
 
     def mark_failed(
         self, category: Category, subcategory: Subcategory, run_id: int, error_text: str
@@ -1632,7 +1707,9 @@ def is_all_publications_url(
 
 async def click_view_all_publications(
     tab: WorkerTab, category: Category, subcategory: Subcategory
-) -> bool:  # Click "00 ALL PUBLICATIONS", wait until the GetPubsBySeriesView URL is recorded (at most 15 seconds) and leave
+) -> tuple[
+    bool, str | None
+]:  # Click "00 ALL PUBLICATIONS", wait until ITS GetPubsBySeriesView URL is recorded (at most 15 seconds) and leave
     page = tab.page  # The tab of this worker
     logger.debug(
         "Looking for the 'ALL PUBLICATIONS' control inside #org-list and #pub-list"
@@ -1646,42 +1723,48 @@ async def click_view_all_publications(
         )  # Wait for it to show up
     except PlaywrightTimeoutError:  # If it never showed up
         logger.debug("'ALL PUBLICATIONS' control was not found")  # Log the miss
-        return False  # Tell the caller nothing was clicked
+        return False, None  # Tell the caller nothing was clicked
     control_text = " ".join(
         (await view_all_control.inner_text(timeout=ACTION_TIMEOUT_MS)).split()
     )  # Read the control's text so the log shows exactly what was clicked
+    await tab.drain()  # Finish recording everything that happened BEFORE the click, so an older request can never be mistaken for the click's request
+    baseline = len(tab.recorded_urls)  # Only URLs recorded after this point count
     logger.debug("Clicking the control with text: %s", control_text[:200])  # Log it
     await view_all_control.click(timeout=ACTION_TIMEOUT_MS)  # Click it
     loop = asyncio.get_running_loop()  # The event loop, used for its clock
     deadline = loop.time() + WAIT_FOR_RECORDING_SECONDS  # The moment the waiting ends
     while True:  # Keep checking until the URL is recorded or the time is up
+        new_urls = tab.recorded_urls[baseline:]  # Everything recorded since the click
         recorded_url = next(
             (
                 url
-                for url in tab.recorded_urls
+                for url in new_urls
                 if is_all_publications_url(
                     url, subcategory.organization_id, category.category_id
                 )
             ),
             None,
-        )  # Look for the GetPubsBySeriesView URL among the recorded ones
+        )  # The URL with THIS subcategory's orgID and catID and series=-1
         if recorded_url is not None:  # It was recorded
             logger.info(
                 "Recorded %s", recorded_url
             )  # Log the exact URL that went into the HAR data
-            break  # Go to the next subcategory
+            return True, recorded_url  # Go to the next subcategory, remembering the URL
         if loop.time() >= deadline or state_stop_requested(
             tab
-        ):  # Out of time (or the crawl is stopping)
+        ):  # Out of time (or the tab is gone)
+            other_urls = [
+                url for url in new_urls if PUBS_BY_SERIES_PATH.lower() in url.lower()
+            ]  # GetPubsBySeriesView URLs that were seen but belong to other ids
             logger.warning(
-                "GetPubsBySeriesView (orgID=%d, catID=%d, series=-1) was NOT recorded within %.0f seconds, moving on",
+                "GetPubsBySeriesView (orgID=%d, catID=%d, series=-1) was NOT recorded within %.0f seconds, moving on. Other GetPubsBySeriesView URLs seen after the click: %s",
                 subcategory.organization_id,
                 category.category_id,
                 WAIT_FOR_RECORDING_SECONDS,
-            )  # Warn, then move on
-            break  # Go to the next subcategory
+                other_urls or "none",
+            )  # Warn, and show what else was seen to help debugging
+            return True, None  # Go to the next subcategory; no URL to remember
         await asyncio.sleep(0.1)  # Check again in a moment
-    return True  # The click worked, so the visit is complete
 
 
 def state_stop_requested(
@@ -1694,7 +1777,9 @@ def state_stop_requested(
 
 async def crawl_subcategory(
     tab: WorkerTab, category: Category, subcategory: Subcategory, state: CrawlState
-) -> bool:  # Visit one full path and report if "ALL PUBLICATIONS" was clicked
+) -> tuple[
+    bool, str | None
+]:  # Visit one full path; report if "ALL PUBLICATIONS" was clicked and which URL it produced
     page = tab.page  # The tab of this worker
     path_text = f"{category.menu_title} > {category.category_name} > {subcategory.subcategory_name}"  # Readable path
     logger.debug("Crawling: %s", path_text)  # Log the full path
@@ -1702,7 +1787,7 @@ async def crawl_subcategory(
     await open_product_index(page, state)  # Start from a clean index page
     await click_category(page, category)  # Go into the category
     await click_subcategory(page, category, subcategory)  # Go into the subcategory
-    viewed_all = await click_view_all_publications(
+    viewed_all, all_publications_url = await click_view_all_publications(
         tab, category, subcategory
     )  # Click "ALL PUBLICATIONS" if it exists
     if viewed_all:  # If the click worked
@@ -1711,7 +1796,7 @@ async def crawl_subcategory(
         logger.info(
             "No 'ALL PUBLICATIONS' control (this is normal), moving on: %s", path_text
         )  # Log it calmly
-    return viewed_all  # Tell the caller what happened
+    return viewed_all, all_publications_url  # Tell the caller what happened
 
 
 async def list_category(
@@ -1823,13 +1908,13 @@ async def run_worker(
                 async with asyncio.timeout(
                     SUBCATEGORY_TIMEOUT_SECONDS
                 ):  # Never let one visit hang forever
-                    viewed_all = await crawl_subcategory(
+                    viewed_all, all_publications_url = await crawl_subcategory(
                         tab, category, subcategory, state
                     )  # Visit it
                 await tab.drain()  # Make sure the traffic of this visit is recorded before the tab moves on
                 database.mark_visited(
-                    category, subcategory, run_id, viewed_all
-                )  # Remember that it is done
+                    category, subcategory, run_id, viewed_all, all_publications_url
+                )  # Remember that it is done, with the URL its click produced
                 settled = True  # The database now holds the result
                 consecutive_failures = 0  # A success resets the counter
             except Exception as error:  # Playwright errors, timeouts and anything unexpected
@@ -2131,6 +2216,10 @@ async def main(log_file_path: Path) -> None:  # Program entry point
                 "Could not write the HAR file, the traffic is still in the database"
             )  # The data is safe in state.db
         database.log_summary()  # Print the overall progress
+        try:  # The check must never hide the real error
+            database.verify_all_publications_urls()  # Prove that every ALL PUBLICATIONS click has its own matching, recorded URL
+        except Exception:  # Any problem while checking
+            logger.exception("The GetPubsBySeriesView check failed")  # Log it
         database.close()  # Close the database file
         logger.info("Log file: %s", log_file_path)  # Remind the user where the log is
 
