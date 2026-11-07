@@ -24,7 +24,7 @@ import ( // start of the standard library import block
 ) // end of the standard library import block
 
 // harFilePath is the location of the HAR file; change this value to point at your own file
-const harFilePath = "download.har" // path to the HAR file that is scanned for catalog addresses
+const harFilePath = "epubs_product_index_run1.har" // path to the HAR file that is scanned for catalog addresses
 
 // targetDestinationDirectory is the folder where every downloaded PDF is saved
 const targetDestinationDirectory = "PDFs" // local folder that is created automatically if it does not exist
